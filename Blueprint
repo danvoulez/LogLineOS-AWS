@@ -1,0 +1,163 @@
+Perfeito, Dan — segue um plano 100% AWS e 10000% automatizado para o LogLineOS core, onboarding de apps, prompt system e memory, tudo LLM-agnóstico. As peças abaixo mapeiam 1:1 com o teu blueprint (kernels, ledger, policies, prompt/bandit, API e memory), só que “embrulhadas” num landing zone e CI/CD totalmente hands-off.
+
+⸻
+
+0) Resultado desejado (zero toque)
+	•	Git push na main = deploy em produção (infra, DB schema, seeds, kernels, policies, APIs, prompts e memória).
+	•	Pipelines orquestram migrações SQL, bootstrap do ledger, seeds (NDJSON/SQL) e smoke tests.
+	•	Operação 24×7 com autoescalonamento, backups, DR, rollbacks, observability, políticas e guardrails — sem tarefas manuais.
+
+⸻
+
+1) Plataforma AWS (automação de ponta a ponta)
+
+1.1 Organização & Segurança
+	•	AWS Organizations + Control Tower: landing zone com contas separadas (prod, staging), guardrails e AWS SSO.
+	•	KMS (chaves por tenant) e Secrets Manager (tokens de provedores LLM).
+	•	CloudTrail + Config + GuardDuty para trilha de auditoria e postura de segurança contínua.
+
+Tudo provisionado por CDK (TypeScript) com pipelines do CodePipeline/CodeBuild e OIDC com GitHub; pipelines criam roles, buckets, VPC, RDS, API, Lambdas, EventBridge, Alarmes.
+
+1.2 Data Plane (ledger)
+	•	Amazon Aurora PostgreSQL (Multi-AZ) com RDS Proxy (conexões Lambda), PITR e snapshots cross-region.
+	•	Instala o schema do ledger.universal_registry e a view visible_timeline (compat “when”) + RLS e índice de idempotência para requests (evita duplicidade).   ￼  ￼  ￼
+	•	RLS + funções app.current_user_id/tenant_id para escopo private/tenant/public.  ￼
+
+1.3 Compute Plane (kernels & bots)
+	•	Stage-0 Loader em AWS Lambda (Node 20): binário imutável que busca a função whitelistada no Manifest, verifica hash/assinatura e executa com contexto mínimo — exatamente como no blueprint (a recomendação original é Deno/Cloud Run; aqui migramos para Lambda).  ￼  ￼  ￼
+	•	Kernels em modo “código no ledger” (carregados pelo Stage-0):
+	•	run_code_kernel com advisory locks, timeout/slow, quotas e “execução assinada”.  ￼
+	•	request_worker_kernel (polling FIFO, lote 8, lock por parent_id). Trigger por EventBridge (cada 1 min).  ￼
+	•	policy_agent_kernel com isolamento e timeout 3s (no AWS, executamos cada policy em Lambda separada para isolar em vez de Web Worker).  ￼
+	•	EventBridge agenda: observer/request_worker minutely; reaper (TTL) diário; rollups horários.
+
+1.4 API Plane (onboarding, prompts, memória, execuções)
+	•	Amazon API Gateway (HTTP API) + Lambda para endpoints:
+	•	/api/execute para agendar execução de uma função (emite request span).  ￼
+	•	/api/timeline/stream para SSE (usar ALB + Lambda p/ streaming estável).  ￼
+	•	Memory API (POST /api/memory, GET /api/memory/:id, GET /api/memory/search, promote, metrics).  ￼
+	•	Auth: JWT do teu tenant (ou Cognito) populando app.user_id/tenant_id nos DB sessions (RLS).  ￼
+
+⸻
+
+2) LLM-agnostic (provider plugável)
+	•	Provedores como spans provider (chave, base URL, model id, custos, limites).
+	•	Kernels de provider chamados pelo prompt_runner (se Bedrock: nativo; se OpenAI/Anthropic/etc.: via Secrets Manager + VPC egress).
+	•	Telemetry por resposta (modelo + compiled_hash) para acurácia, drift e auditoria.  ￼
+
+⸻
+
+3) Prompt System (build → run → eval → bandit)
+	•	Build → compiled_hash (hash imutável do prompt graph).  ￼
+	•	Runner → telemetry (model + hash) e limites de contexto/ferramentas via policies.  ￼  ￼
+	•	Evaluator com stress fixtures para quality gates.  ￼
+	•	Bandit escolhe variante de prompt com feedback loop (qualidade sobe ao longo do tempo).  ￼  ￼
+	•	Policies (ledger-only) de circuit breaker, throttle, slow, confidence escalation e TTL reaper para prompt blocks.  ￼
+
+⸻
+
+4) Memory System (contratos, privacidade, sessão)
+	•	Spans memory validados por schema, com RLS e AES-256-GCM por campo; layers session/temporary/permanent, promotion workflow e auditoria por memory_audit.  ￼  ￼  ￼
+	•	Persistência de sessão (ordem de leitura: session → private → tenant → public) com TTL/consent.  ￼
+	•	APIs públicas para upsert/search/promote/metrics.  ￼
+
+⸻
+
+5) Onboarding de apps (zero atrito)
+	•	Endpoint /api/apps/onboard cria:
+	•	function span do app (código do executor/provider, whitelist no Manifest).
+	•	Policies etiquetadas, quota, slow thresholds.
+	•	Prompt blocks (doctrine/product/app/behavioral_prior) + variantes semente.  ￼
+	•	O observer agenda request de build pós-onboarding (idempotente por índice).  ￼  ￼
+
+⸻
+
+6) Observabilidade, SLOs e Operação “sem mãos”
+	•	CloudWatch (logs, métricas, dashboards), X-Ray (tracing), Synthetics (canários).
+	•	Alarms em latência, erro, throttling, slow exec, quota, custo.
+	•	Policies de métrica & slow (marca status=slow e gera rollups diários).  ￼  ￼
+	•	Backups automáticos (RDS), lifecycle S3, cross-region DR.
+	•	Custos: Budgets + anomaly detection.
+
+⸻
+
+7) CI/CD “10000%”
+
+Monorepo com stacks:
+	•	infra/ (CDK), db/ (SQL + migrações), kernels/ (TS), api/, policies/, prompts/, seeds/.
+Pipelines:
+
+	1.	Plan (sintaxe CDK/SQL, testes unitários dos kernels em VM isolada).
+	2.	Apply (CDK deploy, RDS migrations).
+	3.	Bootstrap do ledger (insere kernels/policies/blocks/variants no universal_registry via funções idempotentes).  ￼
+	4.	Smoke/E2E (executa request → run_code → execution e valida telemetry/metrics).
+	5.	Promote (marcação stable do compiled_hash vigente).  ￼
+
+Sem ação manual: o pipeline faz tudo, inclusive seed e rollbacks. O índice de idempotência impede duplicatas de request.  ￼
+
+⸻
+
+8) Roadmap de execução (curto e certeiro)
+
+Semana 1 — Infra mínima
+	•	CDK: VPC, Aurora PG + Proxy, KMS/Secrets, API GW/ALB, Lambdas, EventBridge.
+	•	Migra as DDL/Views/RLS/Índices do blueprint.  ￼
+
+Semana 2 — Kernels e Manifest
+	•	Stage-0 Loader + run_code, request_worker, policy_agent em spans; Manifest/whitelist.  ￼  ￼  ￼
+
+Semana 3 — APIs e Onboarding
+	•	/api/execute, /timeline/stream, Memory API, /apps/onboard.  ￼  ￼
+
+Semana 4 — Prompt System
+	•	Build/Runner/Eval/Bandit + policies (circuit breaker, slow, ttl).  ￼
+
+Semana 5 — Observabilidade e hardening
+	•	Dashboards, SLOs, canários, DR, budgets.
+	•	E2E seeds e promotion de variantes estáveis.
+
+⸻
+
+9) Já feito e neste repositorio
+
+	monorepo inicial 100% AWS + 10000% automatizado (com pipeline e bootstrap prontos) — é o “esqueleto” para o LogLineOS core, onboarding de apps, prompt system e memory.
+
+Baixar o monorepo (.zip)￼
+
+o que já vem pronto
+	•	Aurora PostgreSQL + RDS Proxy + VPC
+	•	Lambdas: run_code, request_worker, policy_agent, api/execute, api/memory, api/timeline/stream
+	•	EventBridge: agendas minutely (workers)
+	•	API Gateway (HTTP API) com rotas /api/execute, /api/memory, /api/timeline/stream
+	•	Migrations SQL (ledger spans, memory, prompts, policies, views) + seeds NDJSON
+	•	Scripts idempotentes: migrate.ts, seed.ts, bootstrap.sh
+	•	CDK stacks: plataforma (VPC/DB/KMS/Secrets), kernels, API, eventos, pipeline (stub incluído)
+	•	GitHub Actions (opcional) pra lint/build
+
+como ligar em 1 comando (zero atrito)
+	1.	abre o AWS CloudShell (na tua conta AWS).
+	2.	sobe o zip e roda:
+
+unzip loglineos-aws-starter.zip -d ~/workspace && cd ~/workspace/loglineos-aws-starter
+./scripts/bootstrap.sh
+
+isso faz: bootstrap do CDK, deploy das stacks, migrações, seeds. Sem telas manuais.
+
+Obs.: o script tenta detectar o DB_SECRET_ARN automaticamente. Se não achar, ele te imprime o comando pra setar e reexecuta o passo (continua 100% hands-off no dia a dia — é só esse primeiríssimo boot).
+
+como usar (após o deploy)
+	•	POST /api/execute → agenda um request (o request_worker + run_code executam e emitem execution).
+	•	POST /api/memory / GET /api/memory?key=…&owner_id=… → grava/consulta memória por owner_id/tenant_id.
+	•	o policy_agent já marca slow automaticamente (placeholder), e você pode trocar por políticas reais de throttle/circuit breaker sem mudar infra.
+
+onde mexer
+	•	prompts/policies: db/seeds/spans.ndjson (ou cria tuas próprias seeds NDJSON).
+	•	kernels: functions/kernels/*/src/handler.ts (todo o fluxo usa DB_SECRET_ARN via Secrets Manager).
+	•	onboarding de apps: implementa em functions/api/execute o mapeamento function_name → function span + policies por app (o esqueleto já insere request).
+
+próximos upgrades (se quiser, faço já)
+	•	Bandit + evaluator no prompt system (variante por compiled_hash + métricas).
+	•	SSE real por ALB + Lambda (para streams longos).
+	•	Policies ledger-only (ttl, throttle, circuit breaker, confidence escalation) operando via policy_agent.
+	•	Pipeline CodePipeline/CodeBuild conectado ao teu GitHub App Agent por OIDC, pra ficar literalmente “git push → prod”.
+
